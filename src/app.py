@@ -16,12 +16,13 @@ from skimage.segmentation import watershed
 from scipy import ndimage
 from math import hypot
 import numpy as np
+import random
 
 import cv2
 
 
-@st.cache()
-def predict(model, images, device='cpu', transform=None, th=0.3):
+@st.cache(allow_output_mutation=True)
+def predict(model, images, device='cpu', transform=None, same_session=False):
     model.eval()
     preds = []
 
@@ -47,9 +48,17 @@ def predict(model, images, device='cpu', transform=None, th=0.3):
             if device == 'cuda':
                 torch.cuda.empty_cache()
 
-    preds_t = [(np.squeeze(x[0:1, :, :]) > th) for x in preds]
-    return preds_t
+    return preds
+@st.cache(allow_output_mutation=True)
+def binarize(preds, th=0.3):
 
+    if isinstance(preds, list):
+        for p in preds:
+            preds_t = [(np.squeeze(x[0:1, :, :]) > th) for x in preds]
+    else:
+        preds_t = (np.squeeze(x[0:1, :, :]) > th)
+
+    return preds_t
 
 @st.cache
 def post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, foot=40):
@@ -102,80 +111,148 @@ def load_model(path='../pre_trained_models/c-resunet_y.h5', n_features_start=16,
         model = load_model(resume_path=path, device=device, n_features_start=n_features_start, n_out=n_out,
                            fine_tuning=fine_tuning, unfreezed_layers=unfreezed_layers).to(device)
     else:
-        model = nn.DataParallel(c_resunet(arch='c-ResUnet', n_features_start=n_features_start, n_out=1, c0=True)).to(device)
+        model = nn.DataParallel(c_resunet(arch='c-ResUnet', n_features_start=n_features_start, n_out=1, c0=True))
         try:
-            model.load_state_dict(torch.load(path))
+            if device == 'cpu':
+                model.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
+            else:
+                model.load_state_dict(torch.load(path)['model_state_dict'])
         except:
-            model.load_state_dict(torch.load(path)['model_state_dict'])
+            if device == 'cpu':
+                model.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
+            else:
+                model.load_state_dict(torch.load(path)['model_state_dict'])
     return model
 
-
-
-def load_image():
-    uploaded_file = st.file_uploader(label='Pick an image to test', accept_multiple_files = True)
+@st.cache()
+def load_image(uploaded_file):
     if isinstance(uploaded_file, list):
         if len(uploaded_file) == 0:
-            file_to_read = os.listdir('../images')
+            filenames_to_read = os.listdir('../images')
             images = []
-            for fl in file_to_read:
-                st.image('../images/{}'.format(fl))
+            for fl in filenames_to_read:
+                #st.image('../images/{}'.format(fl))
                 image_data = Image.open('../images/{}'.format(fl))
                 img_byte_arr = io.BytesIO()
                 image_data.save(img_byte_arr, format='PNG')  # TODO: switch to tiff format
                 image_data = img_byte_arr.getvalue()
                 images.append(Image.open(io.BytesIO(image_data)))
-            return images
+            return images, filenames_to_read
         else:
             images = []
+            filenames_to_read = []
             for img in uploaded_file:
                 image_data = img.getvalue()
+                filenames_to_read.append(img.name)
                 images.append(Image.open(io.BytesIO(image_data)))
-            st.image(image_data)
-            return Image.open(io.BytesIO(image_data))
+            #st.image(image_data)
+            return images, filenames_to_read
+    ### When accept_multiple file is false:
     else:
         if uploaded_file is not None:
             image_data = uploaded_file.getvalue()
             st.image(image_data)
-            return Image.open(io.BytesIO(image_data))
+            return Image.open(io.BytesIO(image_data)), image_data.name
         else:
             st.image('../images/demo.tiff')
             image_data = Image.open('../images/demo.tiff')
             img_byte_arr = io.BytesIO()
             image_data.save(img_byte_arr, format='PNG') # TODO: switch to tiff format
             image_data = img_byte_arr.getvalue()
-            return Image.open(io.BytesIO(image_data))
+            return Image.open(io.BytesIO(image_data)), image_data.name
+
+
+def display_images(images, filenames):
+    sorted_images = images
+    sorted_filenames = filenames
+
+    if len(sorted_images) > 5:
+        item_to_display = 5
+    else:
+        item_to_display = len(images)
+
+    ncol = st.sidebar.number_input("how many loaded items to display", 0, len(images), item_to_display)
+    shuffle = st.sidebar.number_input("display in random order", 0, 1, 0)
+
+    if shuffle:
+        zipped = list(zip(images, filenames))
+        random.shuffle(zipped)
+        images, filenams = zip(*zipped)
+        cols = st.columns(ncol)
+        idxs = list(range(0, len(images)))
+        for i, x in enumerate(cols):
+            # x.selectbox(f"Input # {filenames[i]}", idxs, key=i)
+            cols[i].image(images[i])
+        st.checkbox('hide the images')
+    else:
+        cols = st.columns(ncol)
+        idxs = list(range(0, len(images)))
+        st.checkbox('hide the images')
+        for i, x in enumerate(cols):
+            # x.selectbox(f"Input # {filenames[i]}", idxs, key=i)
+            cols[i].image(images[i])
 
 
 def main():
-    st.title('Pretrained model demo')
     cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if cuda else "cpu")
-
-    model = load_model(device=device)
-    image = load_image()
-
-    result = st.button('Run on image')
-        #result = st.button('Run on image')
-    st.write('Computing results...')
-    confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.2, 0.05)
-
-    preds = predict(model, image, device, transform=to_Tensor, th=confidence_threshold)
+    device = "cuda" if cuda else "cpu"
     to_PIL = T.ToPILImage()
-    preds = [to_PIL(x.int()*255) for x in preds]
 
-    for p in preds:
-        p = p.convert('L')
-        st.image(p, caption=f"Thresholded images", use_column_width=True)
+    if 'result' not in st.session_state:
+        st.session_state.result = 0
 
-    postprocessing = st.button('Post-processing')
-    st.write('making post-processing.')
+    uploaded_file = st.file_uploader(label='Pick an image to test', accept_multiple_files = True)
 
-    post_processed = post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, foot=40)
-    post_processed = [to_PIL(x) for x in post_processed]
+    #chached
+    model = load_model(device=device)
+    #chached
+    images, filenames = load_image(uploaded_file)
+    #not chached
+    display_images(images, filenames)
 
-    for p in post_processed:
-        p = p.convert('L')
-        st.image(p, caption=f"Thresholded images", use_column_width=True)
+
+    result = st.button('Make Prediction', key='make_prediction')
+    if result:
+        st.session_state.result = 1
+
+    if st.session_state.result:
+        #st.session_state()
+        st.write('Computing results...')
+        confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.2, 0.05)
+
+        preds = predict(model, images, device, transform=to_Tensor)
+        preds_th = binarize(preds, th = confidence_threshold)
+        preds_to_PIL = [to_PIL(x.int()*255) for x in preds_th]
+        preds_to_PIL_converted = []
+
+        for i, p in zip(images,preds_to_PIL) :
+            p = p.convert('L')
+            preds_to_PIL_converted.append(p)
+
+            col1, col2 = st.columns(2)
+            col1.image(i, use_column_width=True)
+            col2.image(p, use_column_width=True)
+            #st.image(p, caption=f"Thresholded images", use_column_width=True)
+
+        postprocessing = st.button('Post-processing')
+        if postprocessing:
+            st.write('making post-processing.')
+            post_processed = post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, foot=40)
+            post_processed_to_PIL = [to_PIL(x) for x in post_processed]
+
+            for p, pp in zip(preds_to_PIL_converted, post_processed_to_PIL):
+                pp = pp.convert('L')
+                col1, col2 = st.columns(2)
+                col1.image(p, use_column_width=True)
+                col2.image(pp, use_column_width=True)
+                #st.image(p, caption=f"Thresholded images", use_column_width=True)
+
+        count_cells = st.button('Count cells')
+        if count_cells:
+            st.write('making post-processing.')
+            post_processed = post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, foot=40)
+            post_processed_to_PIL = [to_PIL(x) for x in post_processed]
+
 
 
 
