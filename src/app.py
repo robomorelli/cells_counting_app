@@ -22,7 +22,7 @@ import cv2
 
 
 @st.cache(allow_output_mutation=True)
-def predict(model, images, device='cpu', transform=None, same_session=False):
+def predict(model, images, device='cpu', transform=None):
     model.eval()
     preds = []
 
@@ -80,6 +80,7 @@ def post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, fo
     # Find object in predicted image
     processed_preds = []
     for p in preds:
+
         labels_pred, nlabels_pred = ndimage.label(p)
         processed = remove_small_holes(labels_pred, area_threshold=area_threshold, connectivity=1,
                                        in_place=False)
@@ -114,18 +115,21 @@ def load_model(path='../pre_trained_models/c-resunet_y.h5', n_features_start=16,
         model = nn.DataParallel(c_resunet(arch='c-ResUnet', n_features_start=n_features_start, n_out=1, c0=True))
         try:
             if device == 'cpu':
-                model.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
+                model.load_state_dict(torch.load(path, map_location=torch.device('cpu'))['model_state_dict'])
             else:
                 model.load_state_dict(torch.load(path)['model_state_dict'])
         except:
             if device == 'cpu':
                 model.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
             else:
-                model.load_state_dict(torch.load(path)['model_state_dict'])
+                model.load_state_dict(torch.load(path))
     return model
 
 @st.cache()
 def load_image(uploaded_file):
+    print('uploading images')
+    st.session_state.result = 0 # TODO: if the new images are a subset of the previous one, keen the st.session_state_result = 1
+
     if isinstance(uploaded_file, list):
         if len(uploaded_file) == 0:
             filenames_to_read = os.listdir('../images')
@@ -192,6 +196,44 @@ def display_images(images, filenames):
             # x.selectbox(f"Input # {filenames[i]}", idxs, key=i)
             cols[i].image(images[i])
 
+def computing_counts(images, preds):
+    # extract predicted objects and counts,
+    if isinstance(preds, list):
+        counts = []
+        for p, i in zip(preds, images):
+            i = np.asarray(i)
+            pred_label, pred_count = ndimage.label(p)
+            pred_objs = ndimage.find_objects(pred_label)
+
+            print(pred_label)
+
+            # compute centers of predicted objects
+            pred_centers = []
+            for ob in pred_objs:
+                pred_centers.append(((int((ob[0].stop - ob[0].start) / 2) + ob[0].start),
+                                     (int((ob[1].stop - ob[1].start) / 2) + ob[1].start)))
+
+                cv2.rectangle(i, (ob[0].start, ob[0].stop), (ob[1].start, ob[1].stop), (255, 255, 255), 4)
+
+            counts.append(i)
+        return counts
+
+    else:
+        pred_label, pred_count = ndimage.label(preds)
+        pred_objs = ndimage.find_objects(pred_label)
+
+
+
+        # compute centers of predicted objects
+        pred_centers = []
+        for ob in pred_objs:
+            pred_centers.append(((int((ob[0].stop - ob[0].start) / 2) + ob[0].start),
+                                 (int((ob[1].stop - ob[1].start) / 2) + ob[1].start)))
+
+            cv2.rectangle(images, (ob[0].start, ob[0].stop), (ob[1].start, ob[1].stop))
+
+        return images
+
 
 def main():
     cuda = torch.cuda.is_available()
@@ -210,22 +252,20 @@ def main():
     #not chached
     display_images(images, filenames)
 
-
     result = st.button('Make Prediction', key='make_prediction')
     if result:
         st.session_state.result = 1
 
     if st.session_state.result:
-        #st.session_state()
         st.write('Computing results...')
         confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.2, 0.05)
 
         preds = predict(model, images, device, transform=to_Tensor)
-        preds_th = binarize(preds, th = confidence_threshold)
+        preds_th = binarize(preds, th=confidence_threshold)
         preds_to_PIL = [to_PIL(x.int()*255) for x in preds_th]
         preds_to_PIL_converted = []
 
-        for i, p in zip(images,preds_to_PIL) :
+        for i, p in zip(images, preds_to_PIL):#TODO: make a function
             p = p.convert('L')
             preds_to_PIL_converted.append(p)
 
@@ -237,10 +277,10 @@ def main():
         postprocessing = st.button('Post-processing')
         if postprocessing:
             st.write('making post-processing.')
-            post_processed = post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, foot=40)
+            post_processed = post_processing(preds_th, area_threshold=600, min_obj_size=200, max_dist=30, foot=40)
             post_processed_to_PIL = [to_PIL(x) for x in post_processed]
 
-            for p, pp in zip(preds_to_PIL_converted, post_processed_to_PIL):
+            for p, pp in zip(preds_to_PIL_converted, post_processed_to_PIL):#TODO: make a function
                 pp = pp.convert('L')
                 col1, col2 = st.columns(2)
                 col1.image(p, use_column_width=True)
@@ -249,11 +289,30 @@ def main():
 
         count_cells = st.button('Count cells')
         if count_cells:
-            st.write('making post-processing.')
-            post_processed = post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, foot=40)
-            post_processed_to_PIL = [to_PIL(x) for x in post_processed]
+            if postprocessing:
+                counts = computing_counts(images, post_processed)
+                counts_to_PIL = [to_PIL(x) for x in counts]
 
+                for i, p in zip(images, counts_to_PIL):#TODO: make a function
+                    p = p.convert('L')
+                    preds_to_PIL_converted.append(p)
 
+                    col1, col2 = st.columns(2)
+                    col1.image(i, use_column_width=True)
+                    col2.image(p, use_column_width=True)
+            else:
+                print(preds_th[0])
+                counts = computing_counts(images, preds_th)
+
+                counts_to_PIL = [to_PIL(x) for x in counts]
+
+                for i, p in zip(images, counts_to_PIL): #TODO: make a function
+                    p = p.convert('L')
+                    preds_to_PIL_converted.append(p)
+
+                    col1, col2 = st.columns(2)
+                    col1.image(i, use_column_width=True)
+                    col2.image(p, use_column_width=True)
 
 
 if __name__ == '__main__':
