@@ -2,7 +2,7 @@ import os
 
 import streamlit as st
 import cv2
-from PIL import Image
+from PIL import Image, ImageDraw
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,9 +17,47 @@ from scipy import ndimage
 from math import hypot
 import numpy as np
 import random
+import PIL
+from streamlit.runtime.legacy_caching import clear_cache
+
+
+from src.utils import load_model
+
+from src.utils import *
+import matplotlib
+matplotlib.use('TkAgg')
 
 import cv2
 
+@st.cache()
+def load_model(path='../pre_trained_models', n_features_start=16, n_out=1, fine_tuning=False,
+               unfreezed_layers=1, device='cpu', model_to_load='yellow'):
+    """Retrieves the trained model and maps it to the CPU by default,
+    can also specify GPU here."""
+    st.session_state.result = 0
+    st.session_state.post_processing = 0
+    if model_to_load == 'green':
+        path = os.path.join(path, "c-resunet_g.h5")
+    elif model_to_load == 'yellow':
+        path = os.path.join(path, "c-resunet_y.h5")
+
+    if fine_tuning:
+        model = load_model(resume_path=path, device=device, n_features_start=n_features_start, n_out=n_out,
+                           fine_tuning=fine_tuning, unfreezed_layers=unfreezed_layers).to(device)
+    else:
+        model = nn.DataParallel(c_resunet(arch='c-ResUnet', n_features_start=n_features_start, n_out=1, c0=True))
+        try:
+            if device == 'cpu':
+                model.load_state_dict(torch.load(path, map_location=torch.device('cpu'))['model_state_dict'])
+            else:
+                model.load_state_dict(torch.load(path)['model_state_dict'])
+        except:
+            if device == 'cpu':
+                model.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
+            else:
+                model.load_state_dict(torch.load(path))
+
+    return model
 
 @st.cache(allow_output_mutation=True)
 def predict(model, images, device='cpu', transform=None):
@@ -50,7 +88,7 @@ def predict(model, images, device='cpu', transform=None):
 
     return preds
 @st.cache(allow_output_mutation=True)
-def binarize(preds, th=0.3):
+def binarize(preds, th=0.7):
 
     if isinstance(preds, list):
         for p in preds:
@@ -61,8 +99,7 @@ def binarize(preds, th=0.3):
     return preds_t
 
 @st.cache
-def post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, foot=40):
-
+def make_post_processing(preds, area_threshold=6, min_obj_size=2, max_dist=3, foot=4):
     '''
      preds: array of tensor (ch, h, w)
      targets: array of tensor (ch, h, w)
@@ -102,33 +139,12 @@ def post_processing(preds, area_threshold=600, min_obj_size=200, max_dist=30, fo
 
     return processed_preds
 
-@st.cache()
-def load_model(path='../pre_trained_models/c-resunet_y.h5', n_features_start=16, n_out=1, fine_tuning=False,
-               unfreezed_layers=1, device='cpu'):
-    """Retrieves the trained model and maps it to the CPU by default,
-    can also specify GPU here."""
 
-    if fine_tuning:
-        model = load_model(resume_path=path, device=device, n_features_start=n_features_start, n_out=n_out,
-                           fine_tuning=fine_tuning, unfreezed_layers=unfreezed_layers).to(device)
-    else:
-        model = nn.DataParallel(c_resunet(arch='c-ResUnet', n_features_start=n_features_start, n_out=1, c0=True))
-        try:
-            if device == 'cpu':
-                model.load_state_dict(torch.load(path, map_location=torch.device('cpu'))['model_state_dict'])
-            else:
-                model.load_state_dict(torch.load(path)['model_state_dict'])
-        except:
-            if device == 'cpu':
-                model.load_state_dict(torch.load(path, map_location=torch.device('cpu')))
-            else:
-                model.load_state_dict(torch.load(path))
-    return model
-
-@st.cache()
+@st.cache(allow_output_mutation=True)
 def load_image(uploaded_file):
     print('uploading images')
     st.session_state.result = 0 # TODO: if the new images are a subset of the previous one, keen the st.session_state_result = 1
+    st.session_state.post_processing = 0
 
     if isinstance(uploaded_file, list):
         if len(uploaded_file) == 0:
@@ -149,7 +165,6 @@ def load_image(uploaded_file):
                 image_data = img.getvalue()
                 filenames_to_read.append(img.name)
                 images.append(Image.open(io.BytesIO(image_data)))
-            #st.image(image_data)
             return images, filenames_to_read
     ### When accept_multiple file is false:
     else:
@@ -170,12 +185,13 @@ def display_images(images, filenames):
     sorted_images = images
     sorted_filenames = filenames
 
+
     if len(sorted_images) > 5:
         item_to_display = 5
     else:
         item_to_display = len(images)
 
-    ncol = st.sidebar.number_input("how many loaded items to display", 0, len(images), item_to_display)
+    ncol = st.sidebar.number_input("how many loaded items to display", 1, len(images), item_to_display)
     shuffle = st.sidebar.number_input("display in random order", 0, 1, 0)
 
     if shuffle:
@@ -187,11 +203,9 @@ def display_images(images, filenames):
         for i, x in enumerate(cols):
             # x.selectbox(f"Input # {filenames[i]}", idxs, key=i)
             cols[i].image(images[i])
-        st.checkbox('hide the images')
     else:
         cols = st.columns(ncol)
         idxs = list(range(0, len(images)))
-        st.checkbox('hide the images')
         for i, x in enumerate(cols):
             # x.selectbox(f"Input # {filenames[i]}", idxs, key=i)
             cols[i].image(images[i])
@@ -200,29 +214,34 @@ def computing_counts(images, preds):
     # extract predicted objects and counts,
     if isinstance(preds, list):
         counts = []
+        bboxes_images = []
         for p, i in zip(preds, images):
-            i = np.asarray(i)
+            i_draw = ImageDraw.Draw(i)
+
             pred_label, pred_count = ndimage.label(p)
             pred_objs = ndimage.find_objects(pred_label)
 
-            print(pred_label)
-
             # compute centers of predicted objects
-            pred_centers = []
+            #pred_centers = []
             for ob in pred_objs:
-                pred_centers.append(((int((ob[0].stop - ob[0].start) / 2) + ob[0].start),
-                                     (int((ob[1].stop - ob[1].start) / 2) + ob[1].start)))
+                #pred_centers.append(((int((ob[0].stop - ob[0].start) / 2) + ob[0].start),
+                #                     (int((ob[1].stop - ob[1].start) / 2) + ob[1].start)))
+                #cv2.rectangle(i_cv, (ob[1].start, ob[0].start), (ob[1].stop, ob[0].stop), (0, 255, 0), 4)
+                i_draw.line( ((ob[1].start -20, ob[0].start -20),
+                              (ob[1].stop + 20, ob[0].start-20),
+                              (ob[1].stop +20, ob[0].stop+20),
+                              (ob[1].start-20, ob[0].stop+20),
+                              (ob[1].start-20, ob[0].start-20)), fill="green", width=9)
 
-                cv2.rectangle(i, (ob[0].start, ob[0].stop), (ob[1].start, ob[1].stop), (255, 255, 255), 4)
+                #i_draw.rectangle([(ob[1].start, ob[0].start), (ob[1].stop, ob[0].stop)], fill=None, outline='green')
 
-            counts.append(i)
-        return counts
+            bboxes_images.append(i)
+            counts.append(pred_count)
+        return bboxes_images, counts
 
     else:
         pred_label, pred_count = ndimage.label(preds)
         pred_objs = ndimage.find_objects(pred_label)
-
-
 
         # compute centers of predicted objects
         pred_centers = []
@@ -243,76 +262,128 @@ def main():
     if 'result' not in st.session_state:
         st.session_state.result = 0
 
-    uploaded_file = st.file_uploader(label='Pick an image to test', accept_multiple_files = True)
+    if 'post_processing' not in st.session_state:
+        st.session_state.post_processing = 0
 
-    #chached
-    model = load_model(device=device)
-    #chached
+    if 'batch_counts' not in st.session_state:
+        st.session_state.batch_counts = 0
+
+    #check_model = st.checkbox('select model and training settings')
+    uploaded_file = st.file_uploader(label='Pick an image to test', accept_multiple_files = True)
+    #if check_model:
+    #    model_to_load = st.selectbox('which model to load', np.array(['green', 'yellow']))
+    #    model_training_status = st.selectbox('which model to load', np.array(['pre-trained']))
+    #else:
+    #    model_to_load = 'green'
+    #    model_training_status = 'pre-training'
+
+    st.info("Select the model to load:")
+    st.markdown(
+        """
+        <style>
+        [data-baseweb="select"] {
+            margin-top: -50px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    model_to_load = st.selectbox("", np.array(['green', 'yellow']))
+    #st.multiselect('which model to load', np.array([]))
+
+    #cached
+    model = load_model(device=device, model_to_load=model_to_load)
+    #cached
     images, filenames = load_image(uploaded_file)
     #not chached
     display_images(images, filenames)
+
+    post_processing_title = '<p style="font-family:sans-serif; color:Green; font-size: 16px;">Post-processing parametes</p>'
+    st.sidebar.markdown(post_processing_title, unsafe_allow_html=True)
 
     result = st.button('Make Prediction', key='make_prediction')
     if result:
         st.session_state.result = 1
 
+
     if st.session_state.result:
-        st.write('Computing results...')
-        confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.2, 0.05)
+        confidence_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.6, 0.05)
 
         preds = predict(model, images, device, transform=to_Tensor)
         preds_th = binarize(preds, th=confidence_threshold)
         preds_to_PIL = [to_PIL(x.int()*255) for x in preds_th]
         preds_to_PIL_converted = []
 
-        for i, p in zip(images, preds_to_PIL):#TODO: make a function
+        images_boxes = []
+        for i in images:
+            images_boxes.append(i.copy())
+
+        bboxes_pil, counts = computing_counts(images_boxes, preds_th)
+
+        for i, p, c in zip(bboxes_pil, preds_to_PIL, counts):#TODO: make a function
             p = p.convert('L')
             preds_to_PIL_converted.append(p)
 
             col1, col2 = st.columns(2)
-            col1.image(i, use_column_width=True)
-            col2.image(p, use_column_width=True)
-            #st.image(p, caption=f"Thresholded images", use_column_width=True)
+            with col1:
+                st.image(i, use_column_width=True)
+                st.caption('cells detected without post processing: {}'.format(c))
+                #post_processing_title = '<p style="font-family:sans-serif; color:Green; font-size: 24px;">Post-processing parametes</p>'
+                #st.sidebar.markdown(post_processing, unsafe_allow_html=True)
+            with col2:
+                st.image(p, use_column_width=True)
 
-        postprocessing = st.button('Post-processing')
-        if postprocessing:
-            st.write('making post-processing.')
-            post_processed = post_processing(preds_th, area_threshold=600, min_obj_size=200, max_dist=30, foot=40)
+        post_processing = st.button('Post-processing')
+        if post_processing:
+            st.session_state.post_processing = 1
+
+        #reset = st.sidebar.button('reset value', key='reset_value')
+        #if reset:
+        #    st.session_state.reset = 1
+
+        if st.session_state.post_processing:
+            if model_to_load == 'yellow':
+                remove_small_object = st.sidebar.slider("small object size, suggested {}".format(200), 0, 1000, 200, 1)
+                area_threshold = st.sidebar.slider("minimum area to keep, suggested {}".format(600), 0, 1000, 600, 1)
+                max_dist = st.sidebar.slider("max_dist to define different object, suggested {}".format(300), 0, 100, 30, 1)
+                foot = st.sidebar.slider("foot, suggested {}".format(400), 0, 100, 40, 1)
+            elif model_to_load == 'green':
+                remove_small_object = st.sidebar.slider("small object size to remove, suggested {}".format(2), 0, 100, 2, 1)
+                area_threshold = st.sidebar.slider("minimum area to keep, suggested {}".format(6), 0, 100, 6, 1)
+                max_dist = st.sidebar.slider("max_dist to define different object, suggested {}".format(3), 0, 100, 3, 1)
+                foot = st.sidebar.slider("foot, suggested {}".format(4), 0, 100, 4, 1)
+
+        if st.session_state.post_processing:
+            post_processed = make_post_processing(preds_th, area_threshold=area_threshold
+                                                  , min_obj_size=remove_small_object , max_dist=max_dist, foot=foot)
             post_processed_to_PIL = [to_PIL(x) for x in post_processed]
 
-            for p, pp in zip(preds_to_PIL_converted, post_processed_to_PIL):#TODO: make a function
-                pp = pp.convert('L')
-                col1, col2 = st.columns(2)
-                col1.image(p, use_column_width=True)
-                col2.image(pp, use_column_width=True)
-                #st.image(p, caption=f"Thresholded images", use_column_width=True)
+            images_boxes_proc = []
+            for i in images:
+                images_boxes_proc.append(i.copy())
+            print('postprocessing', st.session_state.post_processing)
+            if st.session_state.post_processing:
+                bboxes_pil_proc, counts_proc = computing_counts(images_boxes_proc, post_processed)
 
-        count_cells = st.button('Count cells')
-        if count_cells:
-            if postprocessing:
-                counts = computing_counts(images, post_processed)
-                counts_to_PIL = [to_PIL(x) for x in counts]
-
-                for i, p in zip(images, counts_to_PIL):#TODO: make a function
-                    p = p.convert('L')
-                    preds_to_PIL_converted.append(p)
-
+                for i, p, pp, c, cp in zip(images, bboxes_pil, bboxes_pil_proc, counts, counts_proc):#TODO: make a function
                     col1, col2 = st.columns(2)
-                    col1.image(i, use_column_width=True)
-                    col2.image(p, use_column_width=True)
-            else:
-                print(preds_th[0])
-                counts = computing_counts(images, preds_th)
 
-                counts_to_PIL = [to_PIL(x) for x in counts]
+                    with col1:
+                        st.image(p, use_column_width=True)
+                        st.caption('cells detected without post processing: {}'.format(c))
 
-                for i, p in zip(images, counts_to_PIL): #TODO: make a function
-                    p = p.convert('L')
-                    preds_to_PIL_converted.append(p)
+                    with col2:
+                        st.image(pp, use_column_width=True)
+                        st.caption('cells detected with post_processing: {}'.format(cp))
 
-                    col1, col2 = st.columns(2)
-                    col1.image(i, use_column_width=True)
-                    col2.image(p, use_column_width=True)
+    batch_counts = st.button('Run batch analysis TO IMPLEMENT', key='batch_analysis')
+    if batch_counts:
+        st.session_state.batch_counts = 1
+    if st.session_state.batch_counts == 1:
+        st.write('TO IMPLEMENT')
+
+
+
 
 
 if __name__ == '__main__':
