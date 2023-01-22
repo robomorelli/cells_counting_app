@@ -18,6 +18,7 @@ import cv2
 import os
 
 to_Tensor = T.Compose([T.ToTensor(),
+                       #T.CenterCrop((1000, 1400))
                        #T.Lambda(lambda x: x * 1. / 255)
                        ])
 @st.cache()
